@@ -1,5 +1,7 @@
 import logging
 import time
+import math
+import torch
 import typing
 from typing import Callable
 
@@ -16,6 +18,26 @@ from jax import numpy as jnp
 from jax.random import PRNGKey
 from omegaconf import DictConfig, OmegaConf
 
+# Dexmachina imports
+import genesis as gs
+from dexmachina.envs.base_env import BaseEnv 
+from dexmachina.envs.constructors import get_all_env_cfg, get_common_argparser
+import argparse
+from omegaconf import OmegaConf
+
+
+# TEMPORARY FIX
+# --- Globally disable PyTorch 2.6 weights_only security ---
+original_load = torch.load
+
+def patched_load(*args, **kwargs):
+    # Force weights_only to False unless explicitly requested otherwise
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return original_load(*args, **kwargs)
+
+torch.load = patched_load
+
 import wandb
 from src.env_utils.jax_wrappers import (
     BraxGymnaxWrapper,
@@ -23,6 +45,7 @@ from src.env_utils.jax_wrappers import (
     LogWrapper,
     MjxGymnaxWrapper,
     NormalizeVec,
+    DexmachinaGymnaxWrapper,
 )
 from src.jaxrl import utils
 from src.networks.jax_models import (
@@ -870,6 +893,40 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
             push_distractions=cfg.env.get("push_distractions", False),
             asymmetric_observation=cfg.env.get("asymmetric_obs", False),
         )
+    elif cfg.env.type == "dexmachina":       
+        gs.init(backend=gs.gpu, logging_level='warning')
+        
+        # 1. Convert Hydra configs to a flat dictionary
+        env_dict = OmegaConf.to_container(cfg.env, resolve=True)
+        
+        # 2. Inject shared REPPO hyperparameters
+        env_dict["num_envs"] = cfg.hyperparameters.num_envs
+        env_dict["horizon"] = cfg.hyperparameters.max_episode_steps
+        env_dict["learning_rate"] = cfg.hyperparameters.lr
+        env_dict["max_epochs"] = cfg.hyperparameters.num_epochs 
+
+        # 3. THE FIX: Get the actual DexMachina parser and load defaults
+        parser = get_common_argparser()
+        
+        # Parse an empty list to generate a Namespace filled with all default values
+        fake_args, _ = parser.parse_known_args([]) 
+        
+        # 4. Overwrite the defaults with our specific Hydra configs
+        for key, value in env_dict.items():
+            # We use hasattr to avoid adding useless variables like 'vmin' to the DexMachina args
+            if hasattr(fake_args, key) or key in ["clip", "hand", "retarget_name"]:
+                setattr(fake_args, key, value)
+        
+        # 5. Build BaseEnv & Wrap
+        env_kwargs = get_all_env_cfg(fake_args, device='cuda:0')
+        raw_dexmachina_env = BaseEnv(**env_kwargs)
+        
+        env = DexmachinaGymnaxWrapper(
+            env=raw_dexmachina_env,
+            clip_obs=cfg.env.get("clip_obs", math.inf),
+            clip_actions=cfg.env.get("clip_actions", math.inf),
+            asymmetric_obs=cfg.env.get("asymmetric_obs", True),
+        )
     else:
         raise ValueError(f"Unknown environment type: {cfg.env.type}")
 
@@ -906,7 +963,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
 
         key = jax.random.PRNGKey(cfg.seed)
         start = time.perf_counter()
-        _, metrics = jax.jit(train_fn, static_argnums=(1,))(
+        runner_state, metrics = jax.jit(train_fn, static_argnums=(1,))(
             key, ReppoConfig(**cfg.hyperparameters)
         )
         jax.block_until_ready(metrics)
@@ -915,6 +972,90 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         # Save metrics and finish the run
         logging.info(f"Training took {duration:.2f} seconds.")
         jnp.savez("metrics.npz", **metrics)
+
+        # Generate one final video for results confirmation
+        if cfg.env.type == "dexmachina":
+            print("\n>>> Starting Video Evaluation Render...", flush=True)
+            try:
+                # 1. Build a 1-Env config specifically for rendering
+                eval_env_dict = OmegaConf.to_container(cfg.env, resolve=True)
+                eval_env_dict["num_envs"] = 1
+                eval_env_dict["horizon"] = cfg.hyperparameters.max_episode_steps
+                
+                # Inject visualizer and camera kwargs
+                eval_env_dict["record_video"] = True
+                eval_env_dict["render_camera"] = "front"
+                eval_env_dict["scene_kwargs"] = eval_env_dict.get("scene_kwargs", {})
+                eval_env_dict["scene_kwargs"]["use_visualizer"] = True
+                if "camera_kwargs" not in eval_env_dict or not eval_env_dict["camera_kwargs"]:
+                    eval_env_dict["camera_kwargs"] = {
+                        "front": {'res': (256, 256), 'pos': (0.0, -1.6, 2.2), 'lookat': (0.0, -0.1, 1.2), 'fov': 30}
+                    }
+
+                # 2. Build the eval environment
+                parser = get_common_argparser()
+                eval_fake_args, _ = parser.parse_known_args([]) 
+                for key_eval, value_eval in eval_env_dict.items():
+                    if hasattr(eval_fake_args, key_eval) or key_eval in ["clip", "hand", "retarget_name"]:
+                        setattr(eval_fake_args, key_eval, value_eval)
+                
+                eval_env_kwargs = get_all_env_cfg(eval_fake_args, device='cuda:0')
+                raw_eval_env = BaseEnv(**eval_env_kwargs)
+                
+                eval_env = DexmachinaGymnaxWrapper(
+                    env=raw_eval_env,
+                    clip_obs=cfg.env.get("clip_obs", math.inf),
+                    clip_actions=cfg.env.get("clip_actions", math.inf),
+                    asymmetric_obs=cfg.env.get("asymmetric_obs", True),
+                )
+
+                # 3. Rollout loop in standard Python using your script's native policy
+                frames = []
+                eval_key = jax.random.PRNGKey(0)
+                obs, critic_obs, env_state = eval_env.reset(key=eval_key)
+                
+                # Handle multi-seed vs single-seed outputs from runner_state
+                final_train_state = jax.tree.map(
+                    lambda x: x[0] if x.ndim > 0 and x.shape[0] == cfg.num_seeds else x, 
+                    runner_state
+                )
+                
+                # Create the policy using your script's native make_policy function
+                policy = make_policy(final_train_state)
+
+                for step_idx in range(cfg.hyperparameters.max_episode_steps):
+                    eval_key, act_key, step_key = jax.random.split(eval_key, 3)
+                    
+                    # Get the deterministic action from your trained network
+                    action_jax, _ = policy(act_key, obs)
+                    
+                    obs, critic_obs, env_state, reward, done, info = eval_env.step(
+                        step_key, env_state, action_jax
+                    )
+                    
+                    # Grab frame from wrapper
+                    frame = eval_env.render()
+                    if frame is not None:
+                        frames.append(frame)
+                    
+                    if jnp.any(done):
+                        break
+
+                # 4. Process and upload to WandB
+                if frames:
+                    frames_np = np.array(frames)
+                    if frames_np.ndim == 5:
+                        frames_np = frames_np.squeeze(1)
+                    
+                    # WandB requires (Time, Channels, Height, Width)
+                    frames_np = np.transpose(frames_np, (0, 3, 1, 2)) 
+                    
+                    wandb.log({"eval/video": wandb.Video(frames_np, fps=30, format="mp4")})
+                    print(">>> Video successfully uploaded to WandB!", flush=True)
+                    
+            except Exception as e:
+                print(f"Warning: Video rendering failed: {e}", flush=True)
+
         wandb.finish()
 
         sweep_metrics.append(metrics["eval/episode_return"])

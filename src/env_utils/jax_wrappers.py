@@ -15,6 +15,17 @@ from ml_collections import ConfigDict
 from mujoco_playground import MjxEnv, registry
 from mujoco_playground._src.wrapper import wrap_for_brax_training, Wrapper
 
+# Imports for the Dexmachina Jax Wrapper
+import sys
+import math
+import torch
+import numpy as np
+import jax.numpy as jnp
+from typing import Dict
+from gymnax.environments.environment import EnvState
+from torch.utils.dlpack import to_dlpack as pt_to_dlpack, from_dlpack as pt_from_dlpack
+from jax.dlpack import to_dlpack as jax_to_dlpack, from_dlpack as jax_from_dlpack
+
 
 class MjxGymnaxWrapper(Environment):
     def __init__(
@@ -373,3 +384,246 @@ class NormalizeVec(Wrapper):
             done,
             info,
         )
+
+
+# --- Zero-Copy DLPack Memory Converters for Dexmachina Jax Wrapper ---
+def torch_to_jax(pt_tensor: torch.Tensor) -> jax.Array:
+    """Converts a PyTorch GPU Tensor to a JAX GPU Array without copying memory."""
+    if not pt_tensor.is_contiguous():
+        pt_tensor = pt_tensor.contiguous()
+    return jax_from_dlpack(pt_to_dlpack(pt_tensor))
+
+
+def jax_to_torch(jax_array: jax.Array) -> torch.Tensor:
+    """Converts a JAX GPU Array to a PyTorch GPU Tensor without copying memory."""
+    return pt_from_dlpack(jax_to_dlpack(jax_array))
+
+@struct.dataclass
+class DexmachinaState:
+    time: jnp.ndarray
+    truncated: jnp.ndarray  # Added for NormalizeVec wrapper
+    info: Dict[str, jnp.ndarray]
+
+
+class DexmachinaGymnaxWrapper(Environment):
+    """Adapts DexMachina Genesis PyTorch environment for JAX/Gymnax pipelines."""
+
+    def __init__(
+        self,
+        env,
+        clip_obs: float = math.inf,
+        clip_actions: float = math.inf,
+        asymmetric_obs: bool = True,
+    ):
+        super().__init__()
+        self.env = env
+        self.num_envs = env.num_envs
+        self.obs_dim = env.num_obs
+        self.action_dim = env.num_actions
+        self.state_dim = getattr(env, "num_states", self.obs_dim)
+
+        self._clip_obs = clip_obs
+        self._clip_actions = clip_actions
+        self.asymmetric_obs = asymmetric_obs
+
+        self.env_type = "dexmachina"
+        self.max_episode_steps = env.max_episode_length
+
+        # Force Genesis to compile its physics kernels on the main thread 
+        # before JAX takes over and locks the GPU context.
+        print("Warming up Genesis and PyTorch kernels...")
+        self.env.reset()
+        dummy_actions = torch.zeros((self.num_envs, self.action_dim), device='cuda:0')
+        self.env.step(dummy_actions)
+        torch.cuda.synchronize()
+        print("Genesis warmup complete!")
+
+    # ---------------------------------------------------------
+    # HOST FUNCTIONS (Run standard PyTorch + DLPack outside JIT)
+    # ---------------------------------------------------------
+    def _host_reset(self):
+        obs_dict, _ = self.env.reset()
+        obs, critic_obs = self._process_obs(obs_dict)
+        if obs is None:
+            raise ValueError("DexMachina reset returned None for policy observations!")
+        if critic_obs is None:
+            critic_obs = obs
+            
+        torch.cuda.synchronize()
+        return torch_to_jax(obs), torch_to_jax(critic_obs)
+
+    def _host_step(self, actions_jax):
+        actions_pt = jax_to_torch(actions_jax)
+        if not math.isinf(self._clip_actions):
+            actions_pt = torch.clamp(actions_pt, -self._clip_actions, self._clip_actions)
+
+        obs_dict, rew, terminated, truncated, extras = self.env.step(actions_pt)
+        obs, critic_obs = self._process_obs(obs_dict)
+
+        if obs is None:
+            raise ValueError("DexMachina step returned None!")
+        if critic_obs is None:
+            critic_obs = obs
+
+        if rew is None:
+            rew = torch.zeros(self.num_envs, dtype=torch.float32, device='cuda:0')
+        elif not isinstance(rew, torch.Tensor):
+            rew = torch.tensor(rew, dtype=torch.float32, device='cuda:0')
+
+        if terminated is None:
+            terminated = torch.zeros(self.num_envs, dtype=torch.bool, device='cuda:0')
+        elif not isinstance(terminated, torch.Tensor):
+            terminated = torch.tensor(terminated, dtype=torch.bool, device='cuda:0')
+        else:
+            terminated = terminated.to(torch.bool)
+
+        if truncated is None:
+            truncated = torch.zeros(self.num_envs, dtype=torch.bool, device='cuda:0')
+        elif not isinstance(truncated, torch.Tensor):
+            truncated = torch.tensor(truncated, dtype=torch.bool, device='cuda:0')
+        else:
+            truncated = truncated.to(torch.bool)
+
+        torch.cuda.synchronize()
+
+        return (
+            torch_to_jax(obs),
+            torch_to_jax(critic_obs),
+            torch_to_jax(rew),
+            torch_to_jax(terminated | truncated),
+            torch_to_jax(truncated.to(torch.float32))
+        )
+
+    # ---------------------------------------------------------
+    # JAX FUNCTIONS (JIT-Safe Callbacks)
+    # ---------------------------------------------------------
+    def reset(self, key):
+        """JIT-safe reset using io_callback."""
+        # Define expected memory shapes for JAX compiler
+        result_shapes = (
+            jax.ShapeDtypeStruct((self.num_envs, self.obs_dim), jnp.float32),
+            jax.ShapeDtypeStruct((self.num_envs, self.state_dim), jnp.float32),
+        )
+
+        obs_jax, critic_jax = jax.experimental.io_callback(
+            self._host_reset,
+            result_shapes
+        )
+        
+        # Initialize truncation states
+        dummy_state = DexmachinaState(
+            time=jnp.zeros(self.num_envs, dtype=jnp.float32),
+            truncated=jnp.zeros(self.num_envs, dtype=jnp.float32),
+            info={
+                "steps": jnp.zeros(self.num_envs, dtype=jnp.int32),
+                "truncation": jnp.zeros(self.num_envs, dtype=jnp.float32)
+            }
+        )
+        return obs_jax, critic_jax, dummy_state
+
+    def step(self, key, state, action):
+        """JIT-safe step using io_callback."""
+        result_shapes = (
+            jax.ShapeDtypeStruct((self.num_envs, self.obs_dim), jnp.float32),      # obs
+            jax.ShapeDtypeStruct((self.num_envs, self.state_dim), jnp.float32),    # critic_obs
+            jax.ShapeDtypeStruct((self.num_envs,), jnp.float32),                   # rew
+            jax.ShapeDtypeStruct((self.num_envs,), jnp.bool_),                     # done
+            jax.ShapeDtypeStruct((self.num_envs,), jnp.float32),                   # truncated
+        )
+
+        obs_jax, critic_jax, rew_jax, dones_jax, truncated_jax = jax.experimental.io_callback(
+            self._host_step,
+            result_shapes,
+            action
+        )
+
+        # Update the dummy state with step counts and truncation
+        new_state = DexmachinaState(
+            time=state.time + 1.0,
+            truncated=truncated_jax,
+            info={
+                "steps": state.info["steps"] + 1,
+                "truncation": truncated_jax
+            }
+        )
+
+        # Return Gymnax format: obs, critic_obs, state, reward, done, info
+        # Pass truncation back in info dict
+        return obs_jax, critic_jax, new_state, rew_jax, dones_jax, {}
+    
+    def render(self):
+        """
+        Renders using DexMachina's native floating camera.
+        Adapted for JAX/Gymnax.
+        """
+        # self.env is already the DexMachina BaseEnv, no need to peel wrappers!
+        if hasattr(self.env, "_floating_camera") and self.env._floating_camera is not None:
+            try:
+                # 1. Render and grab just the RGB frame from the tuple
+                out = self.env._floating_camera.render(segmentation=False)
+                frame = out[0] if isinstance(out, tuple) else out
+
+                # 2. Move to CPU and convert to NumPy
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.detach().cpu().numpy()
+
+                # 3. Drop the Alpha channel if it's RGBA (WandB requires RGB)
+                if frame.shape[-1] == 4:
+                    frame = frame[..., :3]
+
+                # Note on Batch Dimensions: 
+                # FlashSAC requires (1, H, W, C). 
+                # If reppo expects a standard image (H, W, C), comment the next two lines out!
+                if frame.ndim == 3:
+                    frame = frame[np.newaxis, ...]
+
+                return frame
+            
+            except Exception as e:
+                print(f"[DEBUG] Camera extraction failed: {e}")
+
+        # Ultimate Fallback (Returns a black screen so the run doesn't crash)
+        return np.zeros((1, 256, 256, 3), dtype=np.uint8)
+
+    def _process_obs(self, obs_dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process observations safely in PyTorch before converting to JAX."""
+        # Extract policy observation
+        if isinstance(obs_dict, dict) and "policy" in obs_dict:
+            obs = obs_dict["policy"]
+        else:
+            obs = obs_dict  # Fallback if it's a raw tensor
+
+        if not math.isinf(self._clip_obs):
+            obs = torch.clamp(obs, -self._clip_obs, self._clip_obs)
+
+        # Extract critic state safely
+        critic_obs = obs
+        if self.asymmetric_obs:
+            if isinstance(obs_dict, dict):
+                if "critic" in obs_dict:
+                    critic_obs = obs_dict["critic"]
+                elif "state" in obs_dict:
+                    critic_obs = obs_dict["state"]
+                elif "states" in obs_dict:
+                    critic_obs = obs_dict["states"]
+
+        return obs, critic_obs
+
+    @property
+    def default_params(self):
+        return gymnax.EnvParams()
+    
+    @property
+    def num_actions(self):
+        return self.action_dim
+
+    @property
+    def num_obs(self):
+        return self.obs_dim
+
+    def action_space(self, params=None):
+        return Box(low=-1.0, high=1.0, shape=(self.action_dim,))
+
+    def observation_space(self, params=None):
+        return Box(low=-float("inf"), high=float("inf"), shape=(self.obs_dim,)), \
+               Box(low=-float("inf"), high=float("inf"), shape=(self.state_dim,))

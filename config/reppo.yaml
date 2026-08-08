@@ -80,8 +80,8 @@ num_trials: 10
 tags: ["experimental"]
 wandb:
   mode: "online" # set to online to activate wandb
-  entity: "viper_svg"
-  project: "reppo"
+  entity: null
+  project: null
 
 hydra:
   job:

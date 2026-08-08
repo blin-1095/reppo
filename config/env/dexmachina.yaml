@@ -1,0 +1,15 @@
+# env/dexmachina.yaml
+
+# --- REPPO Base Variables ---
+type: dexmachina
+name: allegro_hand 
+reward_scaling: 1.0
+terminate: true
+asymmetric_obs: true 
+vmin: 0
+vmax: 150
+
+# --- DexMachina Specific Arguments ---
+hand: "allegro_hand"
+clip: "box-30-230"
+retarget_name: "para"
