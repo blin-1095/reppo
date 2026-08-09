@@ -19,6 +19,7 @@ from jax.random import PRNGKey
 from omegaconf import DictConfig, OmegaConf
 
 # Dexmachina imports
+import os
 import genesis as gs
 from dexmachina.envs.base_env import BaseEnv 
 from dexmachina.envs.constructors import get_all_env_cfg, get_common_argparser
@@ -877,6 +878,35 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         }
         wandb.log(log_data, step=state.time_steps[0])
 
+        # SAVE CHECKPOINT 
+        # Compatibility patch for Orbax and current JAX versions
+        if not hasattr(jax.monitoring, 'record_scalar'):
+            jax.monitoring.record_scalar = lambda *args, **kwargs: None
+        if not hasattr(jax.monitoring, 'record_event_duration_secs'):
+            jax.monitoring.record_event_duration_secs = lambda *args, **kwargs: None
+
+        import orbax.checkpoint as ocp
+
+        ckpt_dir = cfg.get("checkpoint_dir", "checkpoints")
+        if ckpt_dir is None:
+            ckpt_dir = "checkpoints"
+        
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        current_step = int(state.time_steps[0].item())
+        ckpt_path = os.path.abspath(os.path.join(ckpt_dir, f"checkpoint_step_{current_step}"))
+
+        checkpointer = ocp.StandardCheckpointer()
+
+        # Orbax natively handles saving full NNX states/pytrees
+        checkpointer.save(
+             ckpt_path, 
+             state
+         )
+
+        checkpointer.wait_until_finished()
+        logging.info(f"Checkpoint successfully saved to {ckpt_path}")
+
     # Set up the experiment
     if cfg.env.type == "brax":
         env = BraxGymnaxWrapper(
@@ -1009,16 +1039,26 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
                     asymmetric_obs=cfg.env.get("asymmetric_obs", True),
                 )
 
-                # 3. Rollout loop in standard Python using your script's native policy
+# 3. Rollout loop in standard Python using your script's native policy
                 frames = []
                 eval_key = jax.random.PRNGKey(0)
                 obs, critic_obs, env_state = eval_env.reset(key=eval_key)
                 
                 # Handle multi-seed vs single-seed outputs from runner_state
                 final_train_state = jax.tree.map(
-                    lambda x: x[0] if x.ndim > 0 and x.shape[0] == cfg.num_seeds else x, 
+                    lambda x: x[0] if getattr(x, 'ndim', 0) > 0 and x.shape[0] == cfg.num_seeds else x, 
                     runner_state
                 )
+                
+                # Extract Normalization Stats!
+                if cfg.hyperparameters.normalize_env and hasattr(final_train_state.last_env_state, 'mean'):
+                    obs_mean = final_train_state.last_env_state.mean
+                    obs_var = final_train_state.last_env_state.var
+                    if obs_mean.ndim > 1:
+                        obs_mean = obs_mean[0]
+                        obs_var = obs_var[0]
+                else:
+                    obs_mean, obs_var = 0.0, 1.0
                 
                 # Create the policy using your script's native make_policy function
                 policy = make_policy(final_train_state)
@@ -1026,8 +1066,14 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
                 for step_idx in range(cfg.hyperparameters.max_episode_steps):
                     eval_key, act_key, step_key = jax.random.split(eval_key, 3)
                     
+                    # Manually normalize the observation before passing to policy
+                    if cfg.hyperparameters.normalize_env:
+                        norm_obs = (obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
+                    else:
+                        norm_obs = obs
+                    
                     # Get the deterministic action from your trained network
-                    action_jax, _ = policy(act_key, obs)
+                    action_jax, _ = policy(act_key, norm_obs)
                     
                     obs, critic_obs, env_state, reward, done, info = eval_env.step(
                         step_key, env_state, action_jax

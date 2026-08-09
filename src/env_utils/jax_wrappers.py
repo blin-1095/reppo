@@ -497,7 +497,7 @@ class DexmachinaGymnaxWrapper(Environment):
     # ---------------------------------------------------------
     # JAX FUNCTIONS (JIT-Safe Callbacks)
     # ---------------------------------------------------------
-    def reset(self, key):
+    def reset(self, key, params=None):
         """JIT-safe reset using io_callback."""
         # Define expected memory shapes for JAX compiler
         result_shapes = (
