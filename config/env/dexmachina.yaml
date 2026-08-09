@@ -13,3 +13,10 @@ vmax: 150
 hand: "allegro_hand"
 clip: "box-30-230"
 retarget_name: "para"
+
+# Enable rewards for dexmachina environment
+reward_cfg:
+  force_penalty: 0.1
+  action_penalty: 0.05
+  imi_rew_weight: 0.5
+  contact_rew_weight: 1.0

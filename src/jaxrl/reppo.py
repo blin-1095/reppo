@@ -856,6 +856,21 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
 
     metric_history = []
 
+    import orbax.checkpoint as ocp
+    
+    ckpt_dir = cfg.get("checkpoint_dir", "checkpoints")
+    if ckpt_dir is None:
+        ckpt_dir = "checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    
+    checkpointer = ocp.StandardCheckpointer()
+    
+    # Compatibility patch
+    if not hasattr(jax.monitoring, 'record_scalar'):
+        jax.monitoring.record_scalar = lambda *args, **kwargs: None
+    if not hasattr(jax.monitoring, 'record_event_duration_secs'):
+        jax.monitoring.record_event_duration_secs = lambda *args, **kwargs: None
+
     def log_callback(state, metrics):
         metrics["sys_time"] = time.perf_counter()
         if len(metric_history) > 0:
@@ -879,32 +894,14 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         wandb.log(log_data, step=state.time_steps[0])
 
         # SAVE CHECKPOINT 
-        # Compatibility patch for Orbax and current JAX versions
-        if not hasattr(jax.monitoring, 'record_scalar'):
-            jax.monitoring.record_scalar = lambda *args, **kwargs: None
-        if not hasattr(jax.monitoring, 'record_event_duration_secs'):
-            jax.monitoring.record_event_duration_secs = lambda *args, **kwargs: None
 
-        import orbax.checkpoint as ocp
-
-        ckpt_dir = cfg.get("checkpoint_dir", "checkpoints")
-        if ckpt_dir is None:
-            ckpt_dir = "checkpoints"
+        checkpointer.wait_until_finished()
         
-        os.makedirs(ckpt_dir, exist_ok=True)
-
         current_step = int(state.time_steps[0].item())
         ckpt_path = os.path.abspath(os.path.join(ckpt_dir, f"checkpoint_step_{current_step}"))
 
-        checkpointer = ocp.StandardCheckpointer()
-
-        # Orbax natively handles saving full NNX states/pytrees
-        checkpointer.save(
-             ckpt_path, 
-             state
-         )
-
-        checkpointer.wait_until_finished()
+        # Save in the background and instantly return to training!
+        checkpointer.save(ckpt_path, state)
         logging.info(f"Checkpoint successfully saved to {ckpt_path}")
 
     # Set up the experiment
@@ -924,6 +921,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
             asymmetric_observation=cfg.env.get("asymmetric_obs", False),
         )
     elif cfg.env.type == "dexmachina":       
+        _ = jax.devices()
         gs.init(backend=gs.gpu, logging_level='warning')
         
         # 1. Convert Hydra configs to a flat dictionary
@@ -935,20 +933,40 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         env_dict["learning_rate"] = cfg.hyperparameters.lr
         env_dict["max_epochs"] = cfg.hyperparameters.num_epochs 
 
-        # 3. THE FIX: Get the actual DexMachina parser and load defaults
+        # 3. Get the actual DexMachina parser and load defaults
         parser = get_common_argparser()
-        
-        # Parse an empty list to generate a Namespace filled with all default values
         fake_args, _ = parser.parse_known_args([]) 
         
         # 4. Overwrite the defaults with our specific Hydra configs
         for key, value in env_dict.items():
-            # We use hasattr to avoid adding useless variables like 'vmin' to the DexMachina args
             if hasattr(fake_args, key) or key in ["clip", "hand", "retarget_name"]:
                 setattr(fake_args, key, value)
+                
+        if "reward_cfg" in env_dict:
+            for k in ["action_penalty", "imi_rew_weight", "contact_rew_weight"]:
+                if k in env_dict["reward_cfg"]:
+                    setattr(fake_args, k, env_dict["reward_cfg"][k])
+                    
+        setattr(fake_args, "use_retarget_contact", True)
         
-        # 5. Build BaseEnv & Wrap
+        # Safely bypass the Imitation kill switches!
+        setattr(fake_args, "early_reset_threshold", 0.0)
+        setattr(fake_args, "aux_reset_thres", [0.0, 0.0, 0.0])
+        
+        # THE FIX: Leave this True so the wrapper unpacks the variables correctly!
+        setattr(fake_args, "use_rl_games", True)
+        # =================================================================
+
+        # 5. Build BaseEnv 
         env_kwargs = get_all_env_cfg(fake_args, device='cuda:0')
+        
+        # =================================================================
+        # 5B. THE SURGICAL BYPASS
+        # =================================================================
+        if "reward_cfg" in env_dict and "force_penalty" in env_dict["reward_cfg"]:
+            env_kwargs["reward_cfg"]["force_penalty"] = env_dict["reward_cfg"]["force_penalty"]
+        # =================================================================
+        
         raw_dexmachina_env = BaseEnv(**env_kwargs)
         
         env = DexmachinaGymnaxWrapper(
@@ -957,6 +975,10 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
             clip_actions=cfg.env.get("clip_actions", math.inf),
             asymmetric_obs=cfg.env.get("asymmetric_obs", True),
         )
+        
+        # Sync your RL algorithm to match the human clip length!
+        cfg.hyperparameters.max_episode_steps = env.max_episode_steps
+
     else:
         raise ValueError(f"Unknown environment type: {cfg.env.type}")
 
@@ -1025,11 +1047,38 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
                 # 2. Build the eval environment
                 parser = get_common_argparser()
                 eval_fake_args, _ = parser.parse_known_args([]) 
+                
                 for key_eval, value_eval in eval_env_dict.items():
                     if hasattr(eval_fake_args, key_eval) or key_eval in ["clip", "hand", "retarget_name"]:
                         setattr(eval_fake_args, key_eval, value_eval)
+                        
+                # =================================================================
+                # COPY NATIVE INTEGRATION TO EVAL ENV
+                # =================================================================
+                if "reward_cfg" in eval_env_dict:
+                    for k in ["action_penalty", "imi_rew_weight", "contact_rew_weight"]:
+                        if k in eval_env_dict["reward_cfg"]:
+                            setattr(eval_fake_args, k, eval_env_dict["reward_cfg"][k])
+                            
+                setattr(eval_fake_args, "use_retarget_contact", True)
+                
+                # Disarm kill switches for the video renderer too!
+                setattr(eval_fake_args, "early_reset_threshold", 0.0)
+                setattr(eval_fake_args, "aux_reset_thres", [0.0, 0.0, 0.0])
+                
+                # VERY IMPORTANT: Keep this True so the wrapper unpacks the video loop correctly!
+                setattr(eval_fake_args, "use_rl_games", True)
+                # =================================================================
                 
                 eval_env_kwargs = get_all_env_cfg(eval_fake_args, device='cuda:0')
+                
+                # =================================================================
+                # COPY SURGICAL BYPASS TO EVAL ENV
+                # =================================================================
+                if "reward_cfg" in eval_env_dict and "force_penalty" in eval_env_dict["reward_cfg"]:
+                    eval_env_kwargs["reward_cfg"]["force_penalty"] = eval_env_dict["reward_cfg"]["force_penalty"]
+                # =================================================================
+
                 raw_eval_env = BaseEnv(**eval_env_kwargs)
                 
                 eval_env = DexmachinaGymnaxWrapper(
@@ -1039,7 +1088,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
                     asymmetric_obs=cfg.env.get("asymmetric_obs", True),
                 )
 
-# 3. Rollout loop in standard Python using your script's native policy
+                # 3. Rollout loop in standard Python using your script's native policy
                 frames = []
                 eval_key = jax.random.PRNGKey(0)
                 obs, critic_obs, env_state = eval_env.reset(key=eval_key)
@@ -1067,6 +1116,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
                     eval_key, act_key, step_key = jax.random.split(eval_key, 3)
                     
                     # Manually normalize the observation before passing to policy
+                    # Needed because we dont call the normalization from make_train_fn here
                     if cfg.hyperparameters.normalize_env:
                         norm_obs = (obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
                     else:
@@ -1084,9 +1134,6 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
                     if frame is not None:
                         frames.append(frame)
                     
-                    if jnp.any(done):
-                        break
-
                 # 4. Process and upload to WandB
                 if frames:
                     frames_np = np.array(frames)
